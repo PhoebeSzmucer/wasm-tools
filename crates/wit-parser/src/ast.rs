@@ -1743,6 +1743,28 @@ struct Source {
     contents: String,
 }
 
+#[derive(Debug)]
+struct ErrorSink {
+    recover: bool,
+    errors: Vec<ParseError>,
+}
+
+impl ErrorSink {
+    fn recovering() -> Self {
+        ErrorSink {
+            recover: true,
+            errors: Vec::new(),
+        }
+    }
+
+    fn fail_fast() -> Self {
+        ErrorSink {
+            recover: false,
+            errors: Vec::new(),
+        }
+    }
+}
+
 impl SourceMap {
     /// Creates a new empty source map.
     pub fn new() -> SourceMap {
@@ -1843,13 +1865,40 @@ impl SourceMap {
         base
     }
 
+    /// Parses the files added to this source map like [`SourceMap::parse`],
+    /// but attempts to recover from errors and continue parsing.
+    ///
+    /// Returns a best-effort [`UnresolvedPackageGroup`] along with all errors
+    /// encountered. Recovery quality is best-effort and unspecified: erroneous
+    /// items are discarded and anything else salvaged. If nothing usable
+    /// survives, returns `Err` with the source map (for rendering the errors)
+    /// and a non-empty error list.
+    pub fn parse_recovering(self) -> (Result<UnresolvedPackageGroup, Self>, Vec<ParseError>) {
+        let mut sink = ErrorSink::recovering();
+        match self.parse_inner(&mut sink) {
+            Ok((main, nested)) => {
+                let group = UnresolvedPackageGroup {
+                    main,
+                    nested,
+                    source_map: self,
+                };
+                (Ok(group), sink.errors)
+            }
+            Err(e) => {
+                sink.errors.push(e);
+                (Err(self), sink.errors)
+            }
+        }
+    }
+
     /// Parses the files added to this source map into a
     /// [`UnresolvedPackageGroup`].
     ///
     /// On failure returns `Err((self, e))` so the caller can use the source
     /// map for error formatting if needed.
     pub fn parse(self) -> Result<UnresolvedPackageGroup, (Self, ParseError)> {
-        match self.parse_inner() {
+        let mut sink = ErrorSink::fail_fast();
+        match self.parse_inner(&mut sink) {
             Ok((main, nested)) => Ok(UnresolvedPackageGroup {
                 main,
                 nested,
@@ -1859,7 +1908,16 @@ impl SourceMap {
         }
     }
 
-    fn parse_inner(&self) -> ParseResult<(UnresolvedPackage, Vec<UnresolvedPackage>)> {
+    /// Shared implementation of [`SourceMap::parse`] and
+    /// [`SourceMap::parse_recovering`].
+    ///
+    /// When `sink.recover` is set, recoverable failures are recorded in
+    /// `sink` and skipped; only a failure of the final `resolve()` escapes
+    /// as `Err`. Otherwise the first error is returned as `Err`.
+    fn parse_inner(
+        &self,
+        sink: &mut ErrorSink,
+    ) -> ParseResult<(UnresolvedPackage, Vec<UnresolvedPackage>)> {
         let mut nested = Vec::new();
         let mut resolver = Resolver::default();
         let mut srcs = self.sources.iter().collect::<Vec<_>>();
@@ -1869,13 +1927,24 @@ impl SourceMap {
         // from settings and then `PackageFile` is used to parse the whole
         // stream of tokens.
         for src in srcs {
-            let mut tokens = Tokenizer::new(
-                // chop off the forcibly appended `\n` character when
-                // passing through the source to get tokenized.
-                &src.contents[..src.contents.len() - 1],
-                src.offset,
-            )?;
-            let mut file = PackageFile::parse(&mut tokens)?;
+            // chop off the forcibly appended `\n` character when
+            // passing through the source to get tokenized.
+            let input = &src.contents[..src.contents.len() - 1];
+
+            let result = Tokenizer::new(input, src.offset)
+                .map_err(ParseError::from)
+                .and_then(|mut tokens| PackageFile::parse(&mut tokens));
+
+            let mut file = match result {
+                Ok(file) => file,
+                Err(e) if sink.recover => {
+                    sink.errors.push(e);
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            };
 
             // Filter out any nested packages and resolve them separately.
             // Nested packages have only a single "file" so only one item
@@ -1889,15 +1958,33 @@ impl SourceMap {
                 match item {
                     AstItem::Package(nested_pkg) => {
                         let mut resolve = Resolver::default();
-                        resolve.push(nested_pkg)?;
-                        nested.push(resolve.resolve()?);
+
+                        match resolve.push(nested_pkg).and_then(|()| resolve.resolve()) {
+                            Ok(package) => nested.push(package),
+                            Err(e) if sink.recover => sink.errors.push(e),
+                            Err(e) => {
+                                return Err(e);
+                            }
+                        }
                     }
                     other => file.decl_list.items.push(other),
                 }
             }
 
             // With nested packages handled push this file into the resolver.
-            resolver.push(file)?;
+            //
+            // Note that continuing after a failed push relies on
+            // `Resolver::push` validating before mutating: a file that fails
+            // to push leaves the resolver usable and none of the file's
+            // declarations registered. The `recovery_package_name_mismatch`
+            // test guards this property.
+            match resolver.push(file) {
+                Ok(()) => {}
+                Err(e) if sink.recover => sink.errors.push(e),
+                Err(e) => {
+                    return Err(e);
+                }
+            }
         }
 
         Ok((resolver.resolve()?, nested))
